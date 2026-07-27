@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define LAUFEY_API_VERSION 34
+#define LAUFEY_API_VERSION 35
 
 // Window handle types for get_window_handle_type
 #define LAUFEY_WINDOW_HANDLE_UNKNOWN 0
@@ -116,6 +116,11 @@ typedef void (*laufey_menu_click_fn)(void* user_data, uint32_t window_id,
 #define LAUFEY_MOUSE_PRESSED 0
 #define LAUFEY_MOUSE_RELEASED 1
 
+// Native cursor grab modes
+#define LAUFEY_CURSOR_GRAB_NONE 0
+#define LAUFEY_CURSOR_GRAB_CONFINED 1
+#define LAUFEY_CURSOR_GRAB_LOCKED 2
+
 // Dialog types
 #define LAUFEY_DIALOG_ALERT 0
 #define LAUFEY_DIALOG_CONFIRM 1
@@ -197,6 +202,21 @@ typedef void (*laufey_mouse_move_fn)(
     double y,           // y position in window coordinates
     uint32_t modifiers  // bitmask of LAUFEY_MOD_* flags
 );
+
+// Callback for relative mouse motion while pointer lock is requested. Deltas
+// are device-dependent and are not DPI-scaled window coordinates. Wayland
+// supplies compositor-generated unaccelerated deltas rather than raw hardware
+// events.
+typedef void (*laufey_mouse_motion_fn)(
+    void* user_data, uint32_t window_id, double delta_x, double delta_y,
+    uint32_t modifiers  // bitmask of LAUFEY_MOD_* flags
+);
+
+// Completion callback for set_cursor_grab. `success` means the backend accepted
+// the request. It is false when local preconditions fail or the native API
+// rejects the mode. Wayland activates constraints asynchronously, and the
+// backend API does not confirm that later compositor event.
+typedef void (*laufey_cursor_grab_result_fn)(void* user_data, bool success);
 
 // Wheel delta mode
 #define LAUFEY_WHEEL_DELTA_PIXEL 0
@@ -841,6 +861,27 @@ struct laufey_backend_api {
   // false if the id is unknown or the backend doesn't support forwarding.
   // NULL on backends older than API version 34.
   bool (*is_click_passthrough_forward)(void* backend_data, uint32_t window_id);
+  // --- Cursor grab (API >= 35) -----------------------------------------------
+  //
+  // Register a global handler for relative mouse motion. The callback receives
+  // events only while a window uses LAUFEY_CURSOR_GRAB_LOCKED. Backends without
+  // native
+  // relative-motion support leave this NULL.
+  void (*set_mouse_motion_handler)(void* backend_data,
+                                   laufey_mouse_motion_fn handler,
+                                   void* user_data);
+
+  // Apply LAUFEY_CURSOR_GRAB_NONE, _CONFINED, or _LOCKED. Acquisition requires
+  // a focused window with the cursor inside it. CONFINED keeps the native
+  // cursor visible and restricts it to the window; LOCKED hides it and enables
+  // relative mouse motion. `callback` is invoked exactly once with whether the
+  // native API accepted the request. A queued request runs on the backend UI
+  // thread; rejection may be synchronous if the request cannot be queued. On
+  // Wayland, acceptance does not confirm later compositor activation. Backends
+  // without cursor-grab support leave this NULL.
+  void (*set_cursor_grab)(void* backend_data, uint32_t window_id, int mode,
+                          laufey_cursor_grab_result_fn callback,
+                          void* user_data);
 };
 
 #ifdef __cplusplus

@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use winit::window::{Window, WindowLevel};
 // Bumping this in lockstep with the capi is mandatory: the capi's `init_api`
 // rejects any backend whose reported `version` differs, and the vtable layout
 // below must match the `laufey_backend_api` struct as of this version.
-pub const LAUFEY_API_VERSION: u32 = 34;
+pub const LAUFEY_API_VERSION: u32 = 35;
 
 /// Creation-time window style flags (mirror `LAUFEY_WINDOW_FLAG_*` in laufey.h).
 pub const LAUFEY_WINDOW_FLAG_FRAMELESS: u32 = 1 << 0;
@@ -83,6 +83,58 @@ pub type LaufeyMouseMoveFn = unsafe extern "C" fn(
   f64,         // y
   u32,         // modifiers
 );
+pub type LaufeyMouseMotionFn = unsafe extern "C" fn(
+  *mut c_void, // user_data
+  u32,         // window_id
+  f64,         // delta_x
+  f64,         // delta_y
+  u32,         // modifiers
+);
+pub type LaufeyCursorGrabResultFn = unsafe extern "C" fn(*mut c_void, bool);
+
+pub struct CursorGrabCompletion {
+  callback: Mutex<Option<(LaufeyCursorGrabResultFn, usize)>>,
+}
+
+impl CursorGrabCompletion {
+  pub fn new(
+    callback: Option<LaufeyCursorGrabResultFn>,
+    callback_data: *mut c_void,
+  ) -> Self {
+    Self {
+      callback: Mutex::new(
+        callback.map(|callback| (callback, callback_data as usize)),
+      ),
+    }
+  }
+
+  pub fn complete(&self, success: bool) {
+    let callback = self.callback.lock().unwrap().take();
+    if let Some((callback, callback_data)) = callback {
+      unsafe { callback(callback_data as *mut c_void, success) };
+    }
+  }
+}
+
+impl std::fmt::Debug for CursorGrabCompletion {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CursorGrabCompletion")
+      .finish_non_exhaustive()
+  }
+}
+
+impl Drop for CursorGrabCompletion {
+  fn drop(&mut self) {
+    let callback = self
+      .callback
+      .get_mut()
+      .unwrap_or_else(|err| err.into_inner())
+      .take();
+    if let Some((callback, callback_data)) = callback {
+      unsafe { callback(callback_data as *mut c_void, false) };
+    }
+  }
+}
 pub type LaufeyMouseClickFn = unsafe extern "C" fn(
   *mut c_void, // user_data
   u32,         // window_id
@@ -564,9 +616,23 @@ pub struct LaufeyBackendApi {
     Option<unsafe extern "C" fn(*mut c_void, u32, bool)>,
   pub is_click_passthrough_forward:
     Option<unsafe extern "C" fn(*mut c_void, u32) -> bool>,
+  // --- Cursor grab (API >= 35) ---
+  pub set_mouse_motion_handler: Option<
+    unsafe extern "C" fn(*mut c_void, Option<LaufeyMouseMotionFn>, *mut c_void),
+  >,
+  pub set_cursor_grab: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      c_int,
+      Option<LaufeyCursorGrabResultFn>,
+      *mut c_void,
+    ),
+  >,
 }
 
 unsafe impl Send for LaufeyBackendApi {}
+unsafe impl Sync for LaufeyBackendApi {}
 
 pub type RuntimeInitFn = unsafe extern "C" fn(*const LaufeyBackendApi) -> c_int;
 pub type RuntimeStartFn = unsafe extern "C" fn() -> c_int;
@@ -1206,6 +1272,9 @@ pub fn create_api_base() -> LaufeyBackendApi {
     // observation API.
     set_click_passthrough_forward: None,
     is_click_passthrough_forward: None,
+    // Cursor grab (API >= 35).
+    set_mouse_motion_handler: None,
+    set_cursor_grab: None,
   }
 }
 
@@ -1784,6 +1853,7 @@ pub struct EventHandlers {
   pub keyboard_handler: Mutex<Option<(LaufeyKeyboardEventFn, usize)>>,
   pub mouse_click_handler: Mutex<Option<(LaufeyMouseClickFn, usize)>>,
   pub mouse_move_handler: Mutex<Option<(LaufeyMouseMoveFn, usize)>>,
+  pub mouse_motion_handler: Mutex<Option<(LaufeyMouseMotionFn, usize)>>,
   pub wheel_handler: Mutex<Option<(LaufeyWheelFn, usize)>>,
   pub cursor_enter_leave_handler:
     Mutex<Option<(LaufeyCursorEnterLeaveFn, usize)>>,
@@ -1799,6 +1869,7 @@ impl EventHandlers {
       keyboard_handler: Mutex::new(None),
       mouse_click_handler: Mutex::new(None),
       mouse_move_handler: Mutex::new(None),
+      mouse_motion_handler: Mutex::new(None),
       wheel_handler: Mutex::new(None),
       cursor_enter_leave_handler: Mutex::new(None),
       focused_handler: Mutex::new(None),
@@ -1891,6 +1962,11 @@ pub enum CommonEvent {
   },
   Focus {
     window_id: u32,
+  },
+  SetCursorGrab {
+    window_id: u32,
+    mode: c_int,
+    completion: CursorGrabCompletion,
   },
   SetApplicationMenu {
     window_id: u32,
@@ -2315,6 +2391,39 @@ macro_rules! define_common_backend_fns {
       if let Some(state) = <$B as $crate::BackendAccess>::get() {
         *state.common().handlers.mouse_move_handler.lock().unwrap() =
           handler.map(|h| (h, user_data as usize));
+      }
+    }
+
+    unsafe extern "C" fn backend_set_mouse_motion_handler(
+      _data: *mut ::std::ffi::c_void,
+      handler: Option<$crate::LaufeyMouseMotionFn>,
+      user_data: *mut ::std::ffi::c_void,
+    ) {
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        *state.common().handlers.mouse_motion_handler.lock().unwrap() =
+          handler.map(|h| (h, user_data as usize));
+      }
+    }
+
+    unsafe extern "C" fn backend_set_cursor_grab(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      mode: ::std::ffi::c_int,
+      callback: Option<$crate::LaufeyCursorGrabResultFn>,
+      callback_data: *mut ::std::ffi::c_void,
+    ) {
+      let completion =
+        $crate::CursorGrabCompletion::new(callback, callback_data);
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        let _ = state.proxy().send_event(
+          <$B as $crate::BackendAccess>::common_event(
+            $crate::CommonEvent::SetCursorGrab {
+              window_id,
+              mode,
+              completion,
+            },
+          ),
+        );
       }
     }
 
@@ -2924,6 +3033,8 @@ macro_rules! fill_common_api {
     $api.set_keyboard_event_handler = Some(backend_set_keyboard_event_handler);
     $api.set_mouse_click_handler = Some(backend_set_mouse_click_handler);
     $api.set_mouse_move_handler = Some(backend_set_mouse_move_handler);
+    $api.set_mouse_motion_handler = Some(backend_set_mouse_motion_handler);
+    $api.set_cursor_grab = Some(backend_set_cursor_grab);
     $api.set_wheel_handler = Some(backend_set_wheel_handler);
     $api.set_cursor_enter_leave_handler =
       Some(backend_set_cursor_enter_leave_handler);
@@ -3480,6 +3591,10 @@ pub const LAUFEY_MOUSE_BUTTON_FORWARD: c_int = 4;
 pub const LAUFEY_MOUSE_PRESSED: c_int = 0;
 pub const LAUFEY_MOUSE_RELEASED: c_int = 1;
 
+pub const LAUFEY_CURSOR_GRAB_NONE: c_int = 0;
+pub const LAUFEY_CURSOR_GRAB_CONFINED: c_int = 1;
+pub const LAUFEY_CURSOR_GRAB_LOCKED: c_int = 2;
+
 /// Convert winit modifier state to LAUFEY modifier bitmask.
 pub fn modifiers_to_laufey(mods: winit::keyboard::ModifiersState) -> u32 {
   let mut flags = 0u32;
@@ -3643,6 +3758,22 @@ pub fn dispatch_mouse_move_event(
     let mods = modifiers_to_laufey(modifiers);
     unsafe {
       cb(user_data as *mut c_void, window_id, x, y, mods);
+    }
+  }
+}
+
+pub fn dispatch_mouse_motion_event(
+  handlers: &EventHandlers,
+  window_id: u32,
+  delta_x: f64,
+  delta_y: f64,
+  modifiers: winit::keyboard::ModifiersState,
+) {
+  let handler = handlers.mouse_motion_handler.lock().unwrap();
+  if let Some((cb, user_data)) = *handler {
+    let mods = modifiers_to_laufey(modifiers);
+    unsafe {
+      cb(user_data as *mut c_void, window_id, delta_x, delta_y, mods);
     }
   }
 }
@@ -3845,7 +3976,26 @@ pub fn find_runtime_library() -> Option<PathBuf> {
   None
 }
 
-pub fn load_and_start_runtime(api: LaufeyBackendApi) {
+fn report_runtime_failure(
+  api: &LaufeyBackendApi,
+  status: &AtomicI32,
+  code: i32,
+  message: &str,
+) {
+  eprintln!("{message}");
+  status.store(code, Ordering::Release);
+  if let Some(quit) = api.quit {
+    unsafe { quit(api.backend_data) };
+  }
+}
+
+pub fn load_and_start_runtime(api: LaufeyBackendApi) -> Arc<AtomicI32> {
+  // The runtime stores this ABI table for the process lifetime. Its function
+  // pointers target the backend executable, so intentionally keep the table
+  // alive even if runtime startup fails or the runtime thread returns.
+  let api: &'static LaufeyBackendApi = Box::leak(Box::new(api));
+  let status = Arc::new(AtomicI32::new(0));
+  let thread_status = status.clone();
   let runtime_path = find_runtime_library();
   match runtime_path {
     Some(path) => {
@@ -3854,7 +4004,12 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) {
         let lib = match Library::new(&path) {
           Ok(l) => l,
           Err(e) => {
-            eprintln!("Failed to load runtime: {}", e);
+            report_runtime_failure(
+              api,
+              &thread_status,
+              -1,
+              &format!("Failed to load runtime: {e}"),
+            );
             return;
           }
         };
@@ -3863,7 +4018,12 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) {
           match lib.get(b"laufey_runtime_init\0") {
             Ok(f) => f,
             Err(e) => {
-              eprintln!("Failed to find laufey_runtime_init: {}", e);
+              report_runtime_failure(
+                api,
+                &thread_status,
+                -1,
+                &format!("Failed to find laufey_runtime_init: {e}"),
+              );
               return;
             }
           };
@@ -3872,29 +4032,77 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) {
           match lib.get(b"laufey_runtime_start\0") {
             Ok(f) => f,
             Err(e) => {
-              eprintln!("Failed to find laufey_runtime_start: {}", e);
+              report_runtime_failure(
+                api,
+                &thread_status,
+                -1,
+                &format!("Failed to find laufey_runtime_start: {e}"),
+              );
               return;
             }
           };
 
-        let result = init(&api);
+        let result = init(api);
         if result != 0 {
-          eprintln!("Runtime init failed with code: {}", result);
+          report_runtime_failure(
+            api,
+            &thread_status,
+            result,
+            &format!("Runtime init failed with code: {result}"),
+          );
           return;
         }
 
         println!("Runtime initialized, starting...");
         let result = start();
         if result != 0 {
-          eprintln!("Runtime start failed with code: {}", result);
+          report_runtime_failure(
+            api,
+            &thread_status,
+            result,
+            &format!("Runtime start failed with code: {result}"),
+          );
         }
 
         std::mem::forget(lib);
       });
     }
     None => {
-      println!("No runtime library found. Set LAUFEY_RUNTIME_PATH or place libruntime in current directory.");
-      println!("Starting without runtime integration...");
+      report_runtime_failure(
+        api,
+        &status,
+        -1,
+        "No runtime library found. Set LAUFEY_RUNTIME_PATH or place libruntime in current directory.",
+      );
     }
+  }
+  status
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::atomic::AtomicUsize;
+
+  unsafe extern "C" fn record_completion(data: *mut c_void, success: bool) {
+    let calls = unsafe { &*(data as *const AtomicUsize) };
+    calls.fetch_add(if success { 10 } else { 1 }, Ordering::SeqCst);
+  }
+
+  #[test]
+  fn cursor_grab_completion_runs_exactly_once() {
+    let calls = AtomicUsize::new(0);
+    let data = (&calls as *const AtomicUsize).cast_mut().cast::<c_void>();
+    {
+      let completion = CursorGrabCompletion::new(Some(record_completion), data);
+      completion.complete(true);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+
+    {
+      let _completion =
+        CursorGrabCompletion::new(Some(record_completion), data);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 11);
   }
 }

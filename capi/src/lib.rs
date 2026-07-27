@@ -29,7 +29,7 @@ pub use mouse::*;
 /// (`github.com/denoland/laufey/releases/tag/v{VERSION}`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const LAUFEY_API_VERSION: u32 = 34;
+pub const LAUFEY_API_VERSION: u32 = 35;
 
 /// Creation-time window style flags for [`Window::new_with_options`].
 /// Mirror the `LAUFEY_WINDOW_FLAG_*` constants in `laufey.h`.
@@ -44,6 +44,23 @@ pub const LAUFEY_WINDOW_HANDLE_APPKIT: i32 = 1;
 pub const LAUFEY_WINDOW_HANDLE_WIN32: i32 = 2;
 pub const LAUFEY_WINDOW_HANDLE_X11: i32 = 3;
 pub const LAUFEY_WINDOW_HANDLE_WAYLAND: i32 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorGrabMode {
+  None,
+  Confined,
+  Locked,
+}
+
+impl CursorGrabMode {
+  fn as_raw(self) -> i32 {
+    match self {
+      Self::None => ffi::LAUFEY_CURSOR_GRAB_NONE as i32,
+      Self::Confined => ffi::LAUFEY_CURSOR_GRAB_CONFINED as i32,
+      Self::Locked => ffi::LAUFEY_CURSOR_GRAB_LOCKED as i32,
+    }
+  }
+}
 pub type LaufeyValue = ffi::laufey_value_t;
 pub type LaufeyBackendApi = ffi::laufey_backend_api_t;
 
@@ -111,20 +128,24 @@ fn js_call_notify() -> &'static Notify {
 }
 
 /// # Safety
-/// `api` must be either null or a valid pointer to a `LaufeyBackendApi` with
-/// static lifetime.
+/// `api` must be null or point to a readable `u32` version prefix. When that
+/// prefix matches [`LAUFEY_API_VERSION`], the full current API struct must be
+/// valid for the program's lifetime.
 pub unsafe fn init_api(api: *const LaufeyBackendApi) -> c_int {
   if api.is_null() {
     return -1;
   }
-  let api_ref: &'static LaufeyBackendApi = unsafe { &*api };
-  if api_ref.version != LAUFEY_API_VERSION {
+  // `version` is the first field in every API revision. Read only that prefix
+  // before constructing a reference to the current, potentially larger struct.
+  let version = unsafe { std::ptr::read_unaligned(api.cast::<u32>()) };
+  if version != LAUFEY_API_VERSION {
     eprintln!(
       "API version mismatch: expected {}, got {}",
-      LAUFEY_API_VERSION, api_ref.version
+      LAUFEY_API_VERSION, version
     );
     return -2;
   }
+  let api_ref: &'static LaufeyBackendApi = unsafe { &*api };
   match BACKEND_API.set(api_ref) {
     Ok(_) => 0,
     Err(_) => -3,
@@ -1024,7 +1045,43 @@ impl Window {
     }
   }
 
+  /// Request a native cursor grab for this window. Acquisition requires focus
+  /// and the cursor to be inside the window. The callback runs exactly once and
+  /// reports whether the native API accepted it. Queued requests run on the
+  /// backend UI thread; rejection may be synchronous when no request can be
+  /// queued. On Wayland, later compositor activation is not confirmed.
+  pub fn set_cursor_grab<F>(&self, mode: CursorGrabMode, callback: F)
+  where
+    F: FnOnce(bool) + Send + 'static,
+  {
+    let api = api();
+    let Some(f) = api.set_cursor_grab else {
+      callback(false);
+      return;
+    };
+
+    unsafe extern "C" fn trampoline(user_data: *mut c_void, success: bool) {
+      let callback = unsafe {
+        Box::from_raw(user_data as *mut Box<dyn FnOnce(bool) + Send>)
+      };
+      callback(success);
+    }
+
+    let callback: Box<Box<dyn FnOnce(bool) + Send>> =
+      Box::new(Box::new(callback));
+    unsafe {
+      f(
+        api.backend_data,
+        self.id,
+        mode.as_raw(),
+        Some(trampoline),
+        Box::into_raw(callback) as *mut c_void,
+      );
+    }
+  }
+
   pub fn close(&self) {
+    mouse::remove_mouse_motion_handler(self.id);
     let api = api();
     if let Some(f) = api.close_window {
       unsafe { f(api.backend_data, self.id) };
@@ -1268,6 +1325,14 @@ impl Window {
     F: Fn(MouseMoveEvent) + Send + Sync + 'static,
   {
     on_mouse_move(self.id, handler);
+    self
+  }
+
+  pub fn on_mouse_motion<F>(self, handler: F) -> Self
+  where
+    F: Fn(MouseMotionEvent) + Send + Sync + 'static,
+  {
+    on_mouse_motion(self.id, handler);
     self
   }
 
@@ -2743,6 +2808,29 @@ macro_rules! main {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn init_api_rejects_short_older_version_prefix() {
+    let old_version = LAUFEY_API_VERSION - 1;
+    let api = (&old_version as *const u32).cast::<LaufeyBackendApi>();
+    assert_eq!(unsafe { init_api(api) }, -2);
+  }
+
+  #[test]
+  fn cursor_grab_modes_match_c_api_constants() {
+    assert_eq!(
+      CursorGrabMode::None.as_raw(),
+      ffi::LAUFEY_CURSOR_GRAB_NONE as i32
+    );
+    assert_eq!(
+      CursorGrabMode::Confined.as_raw(),
+      ffi::LAUFEY_CURSOR_GRAB_CONFINED as i32
+    );
+    assert_eq!(
+      CursorGrabMode::Locked.as_raw(),
+      ffi::LAUFEY_CURSOR_GRAB_LOCKED as i32
+    );
+  }
 
   // --- KeyModifiers ---
 

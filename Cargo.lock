@@ -1908,7 +1908,11 @@ dependencies = [
 name = "laufey-winit"
 version = "0.1.0"
 dependencies = [
+ "core-graphics",
  "laufey-backend-winit-common",
+ "raw-window-handle",
+ "wayland-client",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

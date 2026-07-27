@@ -141,6 +141,11 @@ ensure_handler!(
   set_mouse_move_handler,
   mouse_move_trampoline
 );
+ensure_handler!(
+  ensure_mouse_motion,
+  set_mouse_motion_handler,
+  mouse_motion_trampoline
+);
 ensure_handler!(ensure_wheel, set_wheel_handler, wheel_trampoline);
 ensure_handler!(
   ensure_cursor_enter_leave,
@@ -239,6 +244,65 @@ where
     .lock()
     .unwrap()
     .insert(window_id, Arc::new(handler));
+}
+
+// --- Relative mouse motion ---
+
+#[derive(Debug, Clone, Copy)]
+pub struct MouseMotionEvent {
+  pub window_id: u32,
+  pub delta_x: f64,
+  pub delta_y: f64,
+  pub modifiers: KeyModifiers,
+}
+
+type MouseMotionHandler = Arc<dyn Fn(MouseMotionEvent) + Send + Sync>;
+
+fn mouse_motion_handlers() -> &'static Mutex<HashMap<u32, MouseMotionHandler>> {
+  static STORE: OnceLock<Mutex<HashMap<u32, MouseMotionHandler>>> =
+    OnceLock::new();
+  STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "C" fn mouse_motion_trampoline(
+  _user_data: *mut c_void,
+  window_id: u32,
+  delta_x: f64,
+  delta_y: f64,
+  modifiers: u32,
+) {
+  let event = MouseMotionEvent {
+    window_id,
+    delta_x,
+    delta_y,
+    modifiers: KeyModifiers::from_raw(modifiers),
+  };
+
+  let handler = mouse_motion_handlers()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
+    handler(event);
+  }
+}
+
+pub fn on_mouse_motion<F>(window_id: u32, handler: F)
+where
+  F: Fn(MouseMotionEvent) + Send + Sync + 'static,
+{
+  ensure_mouse_motion();
+  // The close callback also removes this per-window handler.
+  ensure_close_requested();
+  mouse_motion_handlers()
+    .lock()
+    .unwrap()
+    .insert(window_id, Arc::new(handler));
+}
+
+pub(crate) fn remove_mouse_motion_handler(window_id: u32) {
+  mouse_motion_handlers().lock().unwrap().remove(&window_id);
 }
 
 // --- Wheel events ---
@@ -498,6 +562,7 @@ unsafe extern "C" fn close_requested_trampoline(
       }
     }
   }
+  remove_mouse_motion_handler(window_id);
 }
 
 pub fn on_close_requested<F>(window_id: u32, handler: F)
@@ -732,6 +797,18 @@ mod tests {
     // Position must survive the boolean toggle.
     assert_eq!(left.x, 10.5);
     assert_eq!(left.y, 20.5);
+  }
+
+  #[test]
+  fn mouse_motion_preserves_relative_deltas() {
+    let ev = MouseMotionEvent {
+      window_id: 1,
+      delta_x: -3.25,
+      delta_y: 8.5,
+      modifiers: KeyModifiers::default(),
+    };
+    assert_eq!(ev.delta_x, -3.25);
+    assert_eq!(ev.delta_y, 8.5);
   }
 
   #[test]
