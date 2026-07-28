@@ -3976,6 +3976,12 @@ pub fn find_runtime_library() -> Option<PathBuf> {
   None
 }
 
+fn request_backend_quit(api: &LaufeyBackendApi) {
+  if let Some(quit) = api.quit {
+    unsafe { quit(api.backend_data) };
+  }
+}
+
 fn report_runtime_failure(
   api: &LaufeyBackendApi,
   status: &AtomicI32,
@@ -3984,9 +3990,7 @@ fn report_runtime_failure(
 ) {
   eprintln!("{message}");
   status.store(code, Ordering::Release);
-  if let Some(quit) = api.quit {
-    unsafe { quit(api.backend_data) };
-  }
+  request_backend_quit(api);
 }
 
 pub fn load_and_start_runtime(api: LaufeyBackendApi) -> Arc<AtomicI32> {
@@ -4062,6 +4066,9 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) -> Arc<AtomicI32> {
             result,
             &format!("Runtime start failed with code: {result}"),
           );
+        } else {
+          // No runtime remains to service windows after start() returns.
+          request_backend_quit(api);
         }
 
         std::mem::forget(lib);
@@ -4087,6 +4094,23 @@ mod tests {
   unsafe extern "C" fn record_completion(data: *mut c_void, success: bool) {
     let calls = unsafe { &*(data as *const AtomicUsize) };
     calls.fetch_add(if success { 10 } else { 1 }, Ordering::SeqCst);
+  }
+
+  unsafe extern "C" fn record_quit(data: *mut c_void) {
+    let calls = unsafe { &*(data as *const AtomicUsize) };
+    calls.fetch_add(1, Ordering::SeqCst);
+  }
+
+  #[test]
+  fn runtime_completion_requests_backend_quit() {
+    let calls = AtomicUsize::new(0);
+    let mut api = create_api_base();
+    api.backend_data = (&calls as *const AtomicUsize).cast_mut().cast();
+    api.quit = Some(record_quit);
+
+    request_backend_quit(&api);
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
   }
 
   #[test]
