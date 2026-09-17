@@ -785,7 +785,7 @@ impl ApplicationHandler<UserEvent> for App {
             laufey_id,
           );
         if proceed {
-          self.close_window(laufey_id);
+          self.close_window(laufey_id, false);
           if self.windows.is_empty() {
             event_loop.exit();
           }
